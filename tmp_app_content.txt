@@ -1,0 +1,379 @@
+import os
+import re
+from collections import Counter
+from typing import List, Tuple
+
+import requests
+
+import streamlit as st
+from blank_filler import find_blanks_in_docx, replace_one_blank, DOCX_ENABLED as _DOCX_FILL_ENABLED
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass
+
+try:
+    from PyPDF2 import PdfReader as _PdfReader
+except Exception:
+    _PdfReader = None
+
+try:
+    import docx as _docx
+except Exception:
+    _docx = None
+
+st.set_page_config(page_title="Fill DOCX via Chat", layout="wide")
+
+# // Remove fixed-height chat box CSS
+
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+
+if "doc_chunks" not in st.session_state:
+    st.session_state.doc_chunks = []
+
+if "doc_name" not in st.session_state:
+    st.session_state.doc_name = None
+
+# State for DOCX filling
+for k, v in {
+    "docx_work_path": "",
+    "fill_mode": False,
+    "blanks": [],
+    "pending_blank": None,
+}.items():
+    if k not in st.session_state:
+        st.session_state[k] = v
+
+
+def extract_text_from_file(uploaded_file) -> str:
+    name = uploaded_file.name.lower()
+    if name.endswith((".txt", ".md")):
+        data = uploaded_file.read()
+        try:
+            return data.decode("utf-8", errors="ignore")
+        except Exception:
+            return data.decode(errors="ignore")
+    if name.endswith(".pdf"):
+        if _PdfReader is None:
+            return ""
+        try:
+            reader = _PdfReader(uploaded_file)
+            parts = []
+            for page in reader.pages:
+                text = page.extract_text() or ""
+                parts.append(text)
+            return "\n".join(parts)
+        except Exception:
+            return ""
+    if name.endswith(".docx"):
+        if _docx is None:
+            return ""
+        try:
+            doc = _docx.Document(uploaded_file)
+            return "\n".join(p.text for p in doc.paragraphs)
+        except Exception:
+            return ""
+    return ""
+
+
+def chunk_text(text: str, chunk_size: int = 900, overlap: int = 150) -> List[str]:
+    text = re.sub(r"\s+", " ", text).strip()
+    chunks = []
+    start = 0
+    n = len(text)
+    while start < n:
+        end = min(start + chunk_size, n)
+        chunk = text[start:end]
+        chunks.append(chunk)
+        if end == n:
+            break
+        start = max(end - overlap, 0)
+    return [c for c in chunks if c.strip()]
+
+
+def text_to_vector(text: str) -> Counter:
+    tokens = re.findall(r"[a-zA-Z0-9']+", text.lower())
+    return Counter(tokens)
+
+
+def cosine_sim(a: Counter, b: Counter) -> float:
+    if not a or not b:
+        return 0.0
+    common = set(a) & set(b)
+    num = sum(a[t] * b[t] for t in common)
+    denom_a = sum(v * v for v in a.values()) ** 0.5
+    denom_b = sum(v * v for v in b.values()) ** 0.5
+    if denom_a == 0 or denom_b == 0:
+        return 0.0
+    return num / (denom_a * denom_b)
+
+
+def top_k_chunks(query: str, chunks: List[str], k: int = 3) -> List[Tuple[str, float]]:
+    qv = text_to_vector(query)
+    scored = [(c, cosine_sim(qv, text_to_vector(c))) for c in chunks]
+    scored.sort(key=lambda x: x[1], reverse=True)
+    return scored[:k]
+
+
+def generate_local_reply(prompt: str) -> str:
+    if not st.session_state.doc_chunks:
+        return (
+            "I don't have a document loaded. You can upload one from the sidebar. "
+            + "Meanwhile, here's your message back: "
+            + prompt
+        )
+    top = top_k_chunks(prompt, st.session_state.doc_chunks, k=3)
+    relevant = [c for c, s in top if s > 0]
+    if not relevant:
+        return (
+            "I couldn't find relevant excerpts in the document. "
+            "Try rephrasing or ask a different question."
+        )
+    joined = "\n\n".join(relevant)
+    return "Here are relevant excerpts from your document:\n\n" + joined
+
+
+def call_openai(messages: List[dict], context_chunks: List[str], api_key: str) -> str:
+    ctx = "\n\n".join(context_chunks) if context_chunks else ""
+    full_messages = []
+    if ctx:
+        full_messages.append(
+            {
+                "role": "system",
+                "content": "Use the following document context when helpful:\n" + ctx,
+            }
+        )
+    full_messages.extend(messages)
+    try:
+        try:
+            from openai import OpenAI
+
+            client = OpenAI(api_key=api_key)
+            resp = client.chat.completions.create(
+                model=os.environ.get("OPENAI_MODEL", "gpt-4o-mini"),
+                messages=full_messages,
+                temperature=0.2,
+            )
+            return resp.choices[0].message.content.strip()
+        except Exception:
+            import openai
+
+            openai.api_key = api_key
+            resp = openai.ChatCompletion.create(
+                model=os.environ.get("OPENAI_MODEL", "gpt-3.5-turbo"),
+                messages=full_messages,
+                temperature=0.2,
+            )
+            return resp.choices[0].message["content"].strip()
+    except Exception as e:
+        return f"(OpenAI error) {e}"
+
+
+def call_deepseek(messages: List[dict], context_chunks: List[str], api_key: str) -> str:
+    ctx = "\n\n".join(context_chunks) if context_chunks else ""
+    full_messages = []
+    if ctx:
+        full_messages.append(
+            {
+                "role": "system",
+                "content": "Use the following document context when helpful:\n" + ctx,
+            }
+        )
+    full_messages.extend(messages)
+
+    url = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com/chat/completions")
+    model = os.environ.get("DEEPSEEK_MODEL", "deepseek-chat")
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    payload = {"model": model, "messages": full_messages, "temperature": 0.2}
+    try:
+        resp = requests.post(url, headers=headers, json=payload, timeout=60)
+        resp.raise_for_status()
+        data = resp.json()
+        return data.get("choices", [{}])[0].get("message", {}).get("content", "") or "(empty response)"
+    except Exception as e:
+        return f"(DeepSeek error) {e}"
+
+
+st.title("Fill DOCX via Chat")
+
+with st.sidebar:
+    st.subheader("Upload .docx")
+    uploaded = st.file_uploader("Upload a .docx to fill", type=["docx"]) 
+    if st.button("Clear chat"):
+        st.session_state.messages = []
+    if not _DOCX_FILL_ENABLED:
+        st.error("python-docx not installed. Install: pip install python-docx")
+    # Quick download of the current working DOCX
+    if st.session_state.get("docx_work_path"):
+        try:
+            p = st.session_state.docx_work_path
+            with open(p, "rb") as f:
+                data = f.read()
+            st.download_button(
+                "Download current DOCX",
+                data=data,
+                file_name=os.path.basename(p),
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            )
+        except Exception:
+            pass
+
+# Process uploaded .docx
+if uploaded is not None and _DOCX_FILL_ENABLED:
+    if st.session_state.doc_name != uploaded.name:
+        try:
+            import tempfile
+            tmp_path = os.path.join(tempfile.gettempdir(), uploaded.name)
+            with open(tmp_path, "wb") as f:
+                f.write(uploaded.getvalue())
+            st.session_state.docx_work_path = tmp_path
+            st.session_state.doc_name = uploaded.name
+            st.session_state.blanks = [b.__dict__ for b in find_blanks_in_docx(tmp_path)]
+            st.session_state.pending_blank = None
+        except Exception as e:
+            st.error(f"Failed to prepare DOCX: {e}")
+            st.session_state.docx_work_path = ""
+            st.session_state.blanks = []
+
+if st.session_state.docx_work_path:
+    st.caption(f"Loaded: {os.path.basename(st.session_state.docx_work_path)} · Blanks remaining: {len(st.session_state.blanks)}")
+
+# If fill mode is enabled and we have blanks, auto-ask the next question once
+if st.session_state.docx_work_path:
+    if st.session_state.pending_blank is None and st.session_state.blanks:
+        b = st.session_state.blanks[0]
+        st.session_state.pending_blank = b
+        before = " ".join(b.get("before_words", [])).strip()
+        after = " ".join(b.get("after_words", [])).strip()
+        label = b.get("label", "blank")
+        q = f"Please provide a value for '{label}'."
+        st.session_state.messages.append({"role": "assistant", "content": q})
+        # Replace with DeepSeek-generated question (greeting + plain-language explanation) if key is set
+        key = os.environ.get("DEEPSEEK_API_KEY", "")
+        if key:
+            kind = b.get("kind", "unknown")
+            ulen = b.get("underscore_len", 0)
+            underscores_total = sum(1 for _bb in st.session_state.blanks if _bb.get("kind") == "underscore")
+            system = (
+                "You are a friendly assistant helping a user fill placeholders in a DOCX form. "
+                "Use the provided context to infer in plain words what the blank represents, and ask ONE concise question. "
+                "Begin with a short greeting only for the first blank. Output up to 2 lines: first the question, second starting with 'Why:' explaining simply."
+            )
+            user = (
+                f"is_first: true\n"
+                f"blank_index: 1 of {len(st.session_state.blanks)}\n"
+                f"label: {label}\n"
+                f"kind: {kind}\n"
+                f"underscore_length: {ulen}\n"
+                f"underscore_blanks_in_doc: {underscores_total}\n"
+                
+            )
+            try:
+                better_q = call_deepseek([
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ], [], key)
+                st.session_state.messages[-1]["content"] = better_q
+            except Exception:
+                pass
+
+# Chat display (no large fixed box)
+for m in st.session_state.messages:
+    with st.chat_message(m["role"]):
+        st.markdown(m["content"])
+
+prompt = st.chat_input("Type your answer for the blank")
+
+if prompt:
+    st.session_state.messages.append({"role": "user", "content": prompt})
+    with st.chat_message("user"):
+        st.markdown(prompt)
+
+    # If we are in fill mode and a blank is pending, treat the user's input as the answer
+    if st.session_state.docx_work_path and st.session_state.pending_blank is not None:
+        b = st.session_state.pending_blank
+        ans = prompt.strip()
+        try:
+            new_path = replace_one_blank(
+                st.session_state.docx_work_path,
+                paragraph_index=b["paragraph_index"],
+                start=b["start"],
+                end=b["end"],
+                replacement=ans,
+            )
+            st.session_state.docx_work_path = new_path
+            # Re-scan for remaining blanks
+            st.session_state.blanks = [
+                x.__dict__ for x in find_blanks_in_docx(new_path)
+            ]
+            st.session_state.pending_blank = None
+            remaining = len(st.session_state.blanks)
+            confirm = f"Filled the blank with: {ans}. Remaining blanks: {remaining}."
+            st.session_state.messages.append({"role": "assistant", "content": confirm})
+            with st.chat_message("assistant"):
+                st.markdown(confirm)
+            # Offer a quick download link
+            try:
+                with open(new_path, "rb") as f:
+                    data = f.read()
+                import base64
+                b64 = base64.b64encode(data).decode()
+                name = os.path.basename(new_path)
+                st.markdown(f'<a href="data:application/vnd.openxmlformats-officedocument.wordprocessingml.document;base64,{b64}" download="{name}">Download current DOCX</a>', unsafe_allow_html=True)
+            except Exception:
+                pass
+            # Auto-ask next question if available
+            if st.session_state.blanks:
+                b = st.session_state.blanks[0]
+                st.session_state.pending_blank = b
+                before = " ".join(b.get("before_words", [])).strip()
+                after = " ".join(b.get("after_words", [])).strip()
+                label = b.get("label", "blank")
+                q = f"Please provide a value for '{label}'."
+                st.session_state.messages.append({"role": "assistant", "content": q})
+                
+                # with st.chat_message("assistant"):
+                #     st.markdown(q)
+                # DeepSeek refinement for this question (no greeting)
+                key = os.environ.get("DEEPSEEK_API_KEY", "")
+                if key:
+                    kind = b.get("kind", "unknown")
+                    ulen = b.get("underscore_len", 0)
+                    underscores_total = sum(1 for _bb in st.session_state.blanks if _bb.get("kind") == "underscore")
+                    system = (
+                        "You are a friendly assistant helping a user fill placeholders in a DOCX form. "
+                        "Use the provided context to infer in plain words what the blank represents, and ask ONE concise question. "
+                        "Do not greet again. Output up to 2 lines: first the question, second starting with 'Why:' explaining simply."
+                    )
+                    user = (
+                        f"is_first: false\n"
+                        f"label: {label}\n"
+                        f"kind: {kind}\n"
+                        f"underscore_length: {ulen}\n"
+                        f"underscore_blanks_in_doc: {underscores_total}\n"
+                        
+                    )
+                    try:
+                        better_q = call_deepseek([
+                            {"role": "system", "content": system},
+                            {"role": "user", "content": user},
+                        ], [], key)
+                        st.session_state.messages[-1]["content"] = better_q
+                        with st.chat_message("assistant"):
+                            st.markdown(better_q)
+                    except Exception:
+                        pass
+        except Exception as e:
+            err = f"Error while filling: {e}"
+            st.session_state.messages.append({"role": "assistant", "content": err})
+            with st.chat_message("assistant"):
+                st.markdown(err)
+        
+    # If no blank is pending but user typed, acknowledge completion
+    elif st.session_state.docx_work_path and not st.session_state.blanks:
+        done = "All blanks are filled. You can download the document from above."
+        st.session_state.messages.append({"role": "assistant", "content": done})
+        with st.chat_message("assistant"):
+            st.markdown(done)
