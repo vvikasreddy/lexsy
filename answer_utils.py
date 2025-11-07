@@ -1,6 +1,6 @@
 import os
 import re
-from typing import Tuple
+from typing import Tuple, Optional
 
 try:
     import requests  # type: ignore
@@ -136,8 +136,8 @@ def llm_extract_with_deepseek(response: str, label: str, before: str, after: str
         return _extract_regex(response, expected)
 
 
-def extract_and_validate(response: str, label: str, before: str, after: str) -> Tuple[str, bool, str]:
-    expected = infer_expected_type(label, before, after)
+def extract_and_validate(response: str, label: str, before: str, after: str, expected_override: Optional[str] = None) -> Tuple[str, bool, str]:
+    expected = expected_override or infer_expected_type(label, before, after)
     key = os.environ.get("DEEPSEEK_API_KEY", "")
     if key:
         cand = llm_extract_with_deepseek(response, label, before, after, expected, key)

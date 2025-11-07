@@ -15,7 +15,7 @@ except Exception:
 BLANK_PATTERNS = [
     re.compile(r"\$\[[^\]]*\]"),         # $[____] or $[placeholder]
     re.compile(r"(?<!\$)\[[^\]]+\]"),    # [something] that is NOT preceded by a dollar
-    re.compile(r"_{3,}"),                   # ______ (3 or more underscores; variable length)
+    re.compile(r"_{2,}"),                   # __ or longer underscores (2+)
 ]
 
 
@@ -46,7 +46,11 @@ def _label_for_blank(s: str) -> str:
     if m:
         inner = m.group(1).strip() or "blank"
         return inner
-    if re.fullmatch(r"_{3,}", s):
+    # Treat underscore-only blanks as generic label
+    if re.fullmatch(r"_{2,}", s):
+        return "blank"
+    # If the text contains at least two underscore groups (e.g., "__/__/____"), treat as a generic blank
+    if re.search(r"(?:(?<!_)_{2,}(?!_).*){2,}", s):
         return "blank"
     return s.strip("[]$") or "blank"
 
@@ -56,7 +60,8 @@ def _classify_blank(s: str) -> tuple[str, int]:
         return ("dollar_bracket", 0)
     if s.startswith("[") and s.endswith("]"):
         return ("bracket", 0)
-    m = re.fullmatch(r"(_{3,})", s)
+    # Classify a plain underscore run (2 or more)
+    m = re.fullmatch(r"(_{2,})", s)
     if m:
         return ("underscore", len(m.group(1)))
     return ("unknown", 0)

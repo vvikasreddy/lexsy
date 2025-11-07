@@ -28,7 +28,19 @@ except Exception:
 
 st.set_page_config(page_title="Fill DOCX via Chat", layout="wide")
 
-# // Remove fixed-height chat box CSS
+# Keep page scrollable even with many chat messages
+try:
+    st.markdown(
+        """
+        <style>
+        [data-testid="stAppViewContainer"] .main { overflow-y: auto; }
+        .block-container { padding-top: 1rem; }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+except Exception:
+    pass
 
 if "messages" not in st.session_state:
     st.session_state.messages = []
@@ -325,21 +337,15 @@ if st.session_state.get("pending_confirmation"):
                 remaining = len(st.session_state.blanks)
                 confirm = f"Filled the blank with: {display_extracted}. Remaining blanks: {remaining}."
                 st.session_state.messages.append({"role": "assistant", "content": confirm})
-                with st.chat_message("assistant"):
-                    st.markdown(confirm)
             except Exception as e:
                 
                 err = f"Error while filling (1): {e}"
                 st.session_state.messages.append({"role": "assistant", "content": err})
-                with st.chat_message("assistant"):
-                    st.markdown(err)
     with c2:
         if st.button("Enter a different value"):
             st.session_state.pending_confirmation = None
             msg = f"Please provide a valid {expected} for '{label}'."
             st.session_state.messages.append({"role": "assistant", "content": msg})
-            with st.chat_message("assistant"):
-                st.markdown(msg)
 
 # If fill mode is enabled and we have blanks, auto-ask the next question once
 if st.session_state.docx_work_path:
@@ -350,12 +356,18 @@ if st.session_state.docx_work_path:
         after = " ".join(b.get("after_words", [])).strip()
         label = b.get("label", "blank")
         prefix = _greeting() if not st.session_state.messages else None
-        base_q = f"Please provide a value for '{label}'."
+        try:
+            import re as _re2
+            expects_number = (
+                b.get("kind") == "dollar_bracket" and _re2.fullmatch(r"^\$\[_+\]$", b.get("text", "")) is not None
+            )
+        except Exception:
+            expects_number = b.get("kind") == "dollar_bracket"
+        base_q = (
+            f"Please provide a number for '{label}'." if expects_number else f"Please provide a value for '{label}'."
+        )
         q = f"{prefix}\n\n{base_q}" if prefix else base_q
         st.session_state.messages.append({"role": "assistant", "content": q})
-        with st.chat_message("assistant"):
- 
-            st.markdown(q)
         # Replace with DeepSeek-generated question (greeting + plain-language explanation) if key is set
         key = os.environ.get("DEEPSEEK_API_KEY", "")
         if key:
@@ -409,8 +421,36 @@ if prompt:
         before = " ".join(b.get("before_words", [])).strip()
         after = " ".join(b.get("after_words", [])).strip()
         label = b.get("label", "blank")
-        extracted, ok, expected = extract_and_validate(prompt, label, before, after)
-        if ok:
+        # If user typed an affirmation like "proceed", use the previously extracted value
+        _skip = False
+        if _is_yes(prompt):
+            extracted = (pc.get("answer") or pc.get("orig") or "").strip()
+            ok = True
+            expected = pc.get("expected", "text")
+        elif _is_no(prompt):
+            # Ask for a different value explicitly
+            st.session_state.pending_confirmation = None
+            msg = f"Please provide a valid {pc.get('expected','text')} for '{label}'."
+            st.session_state.messages.append({"role": "assistant", "content": msg})
+            with st.chat_message("assistant"):
+                st.markdown(msg)
+            # Stop further processing of this prompt
+            _skip = True
+            extracted = ""
+            ok = False
+            expected = pc.get("expected", "text")
+        else:
+            try:
+                import re as _re2
+                expected_hint = (
+                    "number"
+                    if (b.get("kind") == "dollar_bracket" and _re2.fullmatch(r"^\$\[_+\]$", b.get("text", "")) is not None)
+                    else None
+                )
+            except Exception:
+                expected_hint = "number" if b.get("kind") == "dollar_bracket" else None
+            extracted, ok, expected = extract_and_validate(prompt, label, before, after, expected_hint)
+        if not _skip and ok:
             try:
                 new_path = replace_one_blank(
                     st.session_state.docx_work_path,
@@ -433,7 +473,7 @@ if prompt:
                 st.session_state.messages.append({"role": "assistant", "content": err})
                 with st.chat_message("assistant"):
                     st.markdown(err)
-        else:
+        elif not _skip:
             st.session_state.pending_confirmation = {
                 "answer": extracted,
                 "expected": expected,
@@ -453,7 +493,16 @@ if prompt:
         before = " ".join(b.get("before_words", [])).strip()
         after = " ".join(b.get("after_words", [])).strip()
         label = b.get("label", "blank")
-        extracted, ok, expected = extract_and_validate(prompt, label, before, after)
+        try:
+            import re as _re2
+            expected_hint = (
+                "number"
+                if (b.get("kind") == "dollar_bracket" and _re2.fullmatch(r"^\$\[_+\]$", b.get("text", "")) is not None)
+                else None
+            )
+        except Exception:
+            expected_hint = "number" if b.get("kind") == "dollar_bracket" else None
+        extracted, ok, expected = extract_and_validate(prompt, label, before, after, expected_hint)
         try:
             if ok:
                 new_path = replace_one_blank(
@@ -502,11 +551,19 @@ if prompt:
                 before = " ".join(b.get("before_words", [])).strip()
                 after = " ".join(b.get("after_words", [])).strip()
                 label = b.get("label", "blank")
-                base_q = f"Please provide a value for '{label}'."
+                try:
+                    import re as _re2
+                    expects_number = (
+                        b.get("kind") == "dollar_bracket" and _re2.fullmatch(r"^\$\[_+\]$", b.get("text", "")) is not None
+                    )
+                except Exception:
+                    expects_number = b.get("kind") == "dollar_bracket"
+                base_q = (
+                    f"Please provide a number for '{label}'." if expects_number else f"Please provide a value for '{label}'."
+                )
                 q = base_q
                 st.session_state.messages.append({"role": "assistant", "content": q})
                 with st.chat_message("assistant"):
- 
                     st.markdown(q)
                 key = os.environ.get("DEEPSEEK_API_KEY", "")
                 if key:
@@ -533,8 +590,7 @@ if prompt:
                             {"role": "user", "content": user},
                         ], [], key)
                         st.session_state.messages[-1]["content"] = better_q
-                        with st.chat_message("assistant"):
-                            st.markdown(better_q)
+                        # message already appended; rely on loop to render
                     except Exception:
                         print(" i a, here")
                         pass
